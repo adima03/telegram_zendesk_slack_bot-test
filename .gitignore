@@ -5,9 +5,9 @@ build/
 dist/
 wheels/
 *.egg-info
-
-# Virtual environments
 .venv
-
 bot_state.json
 .env
+data/
+*.pyc
+*.log
