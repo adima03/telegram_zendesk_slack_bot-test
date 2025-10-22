@@ -1,5 +1,10 @@
-# bot.py
+import os
+from dotenv import load_dotenv
 
+if os.getenv("ENV") != "production":
+    load_dotenv()
+
+from state_manager import add_active_monitor, remove_active_monitor, load_state
 import logging
 import time
 from collections import defaultdict
@@ -8,7 +13,6 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from zendesk_client import create_ticket, get_ticket_comments, get_ticket_info
 from slack_client import send_slack_notification
 import asyncio
-import os
 
 # === Настройки безопасности ===
 MAX_MESSAGE_LENGTH = 1000  # Макс. 1000 символов в сообщении
@@ -35,8 +39,9 @@ logger = logging.getLogger(__name__)
 # Глобальный словарь для отслеживания активных мониторингов тикетов
 active_monitors = {}
 
-# Импортируем конфигурацию
-from config import TELEGRAM_BOT_TOKEN, BOT_USERNAME
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "my_bot")  # с fallback
 
 
 def detect_ticket_category(text: str) -> str:
@@ -141,6 +146,8 @@ async def handle_mention(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # === Отвечаем пользователю ===
     await message.reply_text(f"✅ Support ticket #{ticket_id} has been created.")
 
+    add_active_monitor(ticket_id, user.id, chat_id, message.message_id)
+
     # === ЗАЩИТА ОТ ДУБЛИРОВАНИЯ МОНИТОРИНГА ===
     if ticket_id in active_monitors:
         logger.warning(f"Мониторинг для тикета {ticket_id} уже запущен")
@@ -157,13 +164,34 @@ async def handle_mention(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active_monitors[ticket_id] = task
         task.add_done_callback(lambda t: active_monitors.pop(ticket_id, None))
 
-
 async def monitor_ticket_comments(ticket_id: int, user_id: int, chat_id: int, original_message_id: int, bot):
     logger.info(f"🚀 Мониторинг тикета {ticket_id} запущен")
     last_comment_id = None
 
     while True:
         try:
+            # === Проверяем статус тикета ===
+            ticket_info = await get_ticket_info(ticket_id)
+            if not ticket_info:
+                logger.warning(f"Тикет {ticket_id} не найден, завершаем мониторинг")
+                remove_active_monitor(ticket_id)
+                break
+
+            status = ticket_info["ticket"].get("status")
+            # Реагируем на "solved" И "closed"
+            if status in ("solved", "closed"):
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text="✅ Your request has been resolved. Thank you!",
+                        reply_to_message_id=original_message_id
+                    )
+                except Exception as e:
+                    logger.error(f"Не удалось отправить уведомление о решении: {e}")
+                remove_active_monitor(ticket_id)
+                break
+
+            # === Проверяем комментарии ===
             comments = await get_ticket_comments(ticket_id)
             if not comments:
                 await asyncio.sleep(15)
@@ -172,15 +200,15 @@ async def monitor_ticket_comments(ticket_id: int, user_id: int, chat_id: int, or
             latest = comments[-1]
             comment_id = latest["id"]
             author_id = latest.get("author_id")
-
-            ticket_info = await get_ticket_info(ticket_id)
             requester_id = ticket_info["ticket"]["requester_id"]
 
+            # Пропускаем комментарии от клиента
             if author_id == requester_id:
                 last_comment_id = comment_id
                 await asyncio.sleep(15)
                 continue
 
+            # Отправляем новые комментарии от агентов
             if comment_id != last_comment_id:
                 body = latest["body"]
                 if "—\nSent from" in body:
@@ -203,12 +231,31 @@ async def monitor_ticket_comments(ticket_id: int, user_id: int, chat_id: int, or
         await asyncio.sleep(15)
 
 
+
 def main():
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application = Application.builder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
+
+    # === Восстанавливаем активные мониторинги при старте ===
+    for ticket_id, data in load_state().items():
+        logger.info(f"🔄 Восстанавливаю мониторинг для тикета {ticket_id}")
+        # Используем job_queue для отложенного запуска
+        application.job_queue.run_once(
+            lambda ctx, tid=ticket_id, d=data: asyncio.create_task(
+                monitor_ticket_comments(
+                    ticket_id=tid,
+                    user_id=d["user_id"],
+                    chat_id=d["chat_id"],
+                    original_message_id=d["message_id"],
+                    bot=ctx.application.bot
+                )
+            ),
+            when=1  # через 1 секунду после старта
+        )
+    # =======================================================
+
     application.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, handle_mention))
     logger.info("🚀 Бот запущен. Ожидание упоминаний...")
     application.run_polling()
-
 
 if __name__ == "__main__":
     main()
